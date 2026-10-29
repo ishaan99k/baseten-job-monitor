@@ -93,6 +93,7 @@ REGION_RE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")
 
 AWS_TIMEOUT = 25           # seconds for a single aws CLI call
 EC2_POLL_INTERVAL = 60     # seconds between EC2 state polls
+EC2_RETRY_INTERVAL = 10    # faster re-check while signed out or erroring, so sign-in shows up quickly
 # How often usage (CPU/RAM/GPU/processes) is sampled on each box and on this
 # Mac, and how often the menu redraws. Chosen from the dropdown; stored as
 # BTMON_USAGE_INTERVAL. 10s is a light touch on the boxes; pick 2s when you
@@ -1707,7 +1708,9 @@ def stream_forever() -> None:
             except Exception as exc:  # keep the stream alive no matter what
                 with state.lock:
                     state.fetched = {"boxes": [], "error": f"poll failed: {exc}"[:200], "auth_error": False}
-            time.sleep(EC2_POLL_INTERVAL)
+            with state.lock:
+                unhealthy = bool(state.fetched.get("error")) or state.fetched.get("auth_error")
+            time.sleep(EC2_RETRY_INTERVAL if unhealthy else EC2_POLL_INTERVAL)
 
     def bt_poller():
         while True:
@@ -1750,6 +1753,9 @@ def stream_forever() -> None:
 LAUNCH_DIR = os.path.expanduser("~/Library/Application Support/baseten-job-monitor/launch")
 
 
+REFRESH_SELF = ["/usr/bin/open", "-g", "swiftbar://refreshplugin?name=monitor"]
+
+
 def _terminal_app() -> str:
     """Honor SwiftBar's terminal preference (Terminal or iTerm); default Terminal."""
     try:
@@ -1762,7 +1768,7 @@ def _terminal_app() -> str:
     return "iTerm" if "iterm" in out else "Terminal"
 
 
-def open_in_terminal(cmd: list[str], title: str) -> None:
+def open_in_terminal(cmd: list[str], title: str, after: list[str] | None = None) -> None:
     """Open a new terminal window running `cmd`.
 
     SwiftBar's own `terminal=false` drives Terminal through AppleScript and
@@ -1780,20 +1786,28 @@ def open_in_terminal(cmd: list[str], title: str) -> None:
         'rm -f "$0"\n'  # one-shot launcher; the shell already has it open
         f"printf '\\033]0;%s\\007' {shlex.quote(safe_title)}\n"
         f"echo {shlex.quote('$ ' + quoted)}\n"
-        f"exec {quoted}\n"
     )
+    if after:
+        # Run the main command, then the follow-up regardless of its exit code.
+        body += f"{quoted}; rc=$?\n{' '.join(shlex.quote(c) for c in after)}\nexit $rc\n"
+    else:
+        body += f"exec {quoted}\n"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(body)
     subprocess.run(["/usr/bin/open", "-a", _terminal_app(), path], capture_output=True, timeout=10)
 
 
-def run_interactive(cmd: list[str], title: str) -> None:
+def run_interactive(cmd: list[str], title: str, after: list[str] | None = None) -> None:
     """Run `cmd` in the current terminal if we have one, else open a new one."""
     if sys.stdin.isatty():
         print(f"$ {' '.join(shlex.quote(c) for c in cmd)}")
+        if after:
+            rc = subprocess.run(cmd).returncode
+            subprocess.run(after)
+            sys.exit(rc)
         os.execvp(cmd[0], cmd)
-    open_in_terminal(cmd, title)
+    open_in_terminal(cmd, title, after)
 
 
 def notify(message: str, title: str = "Baseten Monitor") -> None:
@@ -1837,7 +1851,9 @@ def action(name: str, instance_id: str, host: str = "") -> None:
         return
 
     if name == "--aws-login":
-        run_interactive(aws_login_cmd(cfg), "AWS sign in")
+        # Once the login finishes, restart the stream so the menu re-polls EC2
+        # right away instead of waiting for the next scheduled poll.
+        run_interactive(aws_login_cmd(cfg), "AWS sign in", after=REFRESH_SELF)
         return
 
     if name == "--aws-usage-interval":
