@@ -38,7 +38,8 @@ The plugin is `monitor.py`. Click any section header (a box, the Mac, or the Bas
 - Each box keeps one persistent SSH session open for the metrics stream. If the connection drops (laptop sleep, network change) it reconnects by itself, and stale readings are labelled.
 - Clicking a box pins it to the menu bar (clicking the pinned one unpins it). SSH, htop, SSM, and the AWS console are options in the box's submenu.
 - Submenu actions: open `htop` in Terminal, open in the AWS console, connect via SSM or SSH, copy the IP or instance ID, start a stopped box, or stop a running one (with a confirmation dialog)
-- A "Sign in" action appears in the menu when your AWS session has expired
+- A "Sign in" action appears in the menu when your AWS session has expired. If your profile is set up for IAM Identity Center it runs `aws sso login`, which opens your organization's own start page; otherwise it runs `aws login`.
+- If your organization only allows sign-in through its Identity Center start URL (something like `https://xxx.awsapps.com/start`), use **Set up SSO sign-in (aws configure sso)…** under the sign-in prompt. That runs the AWS CLI's own wizard, which asks for the URL and region and writes them to your `~/.aws/config`. The plugin never stores or hardcodes that URL; it only reads your profile to decide which login command to run.
 
 ### This Mac
 
@@ -122,7 +123,7 @@ Any of those keys can also be set as environment variables, which take priority 
 
 The plugin is deliberately unable to hold AWS secrets:
 
-- **No credentials are stored or read by the plugin.** Every AWS call shells out to the `aws` CLI, which uses whatever sign-in you already have: an `aws login` / `aws sso login` session, a named profile, or a `credential_process`. With SSO there are no long-lived keys on disk at all. When the session expires the menu shows a **Sign in** action that runs the right login command for your profile.
+- **No credentials are stored or read by the plugin.** Every AWS call shells out to the `aws` CLI, which uses whatever sign-in you already have: an `aws sso login` session with your organization's Identity Center, an `aws login` session, a named profile, or a `credential_process`. With SSO there are no long-lived keys on disk at all. When the session expires the menu shows a **Sign in** action that runs the right login command for your profile. Organization-specific details such as the SSO start URL stay in your own `~/.aws/config`, written by `aws configure sso`.
 - **The config file only holds non-secret settings** (profile name, region, which instances are yours, SSH username, and the *path* to your SSH key). It is plain `KEY=VALUE` text that the plugin parses itself; it is never `source`d or executed.
 - **The SSH key is never read by the plugin.** Its path is handed to `ssh -i`, and only if the key file is owned by you and not readable by anyone else; otherwise the SSH action falls back to your `~/.ssh/config` and the menu shows a warning.
 - **Usage metrics use the same SSH access you already have.** The plugin pipes a short, fixed shell script (read `/proc/stat`, `free`, `df`, and `nvidia-smi` if present, in a loop) to `sh` on the box in batch mode, so it never prompts for a password and never runs anything from the config file. If SSH fails, the menu just says usage is unavailable and retries.

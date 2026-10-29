@@ -276,8 +276,8 @@ def aws_base_cmd(cfg: dict) -> list[str]:
     return cmd
 
 
-def aws_login_cmd(cfg: dict) -> list[str]:
-    """Pick the sign-in command that matches the profile's config."""
+def _profile_keys(cfg: dict) -> tuple[str, set[str]]:
+    """(profile name, keys present in its ~/.aws/config section)."""
     profile = cfg.get("profile") or os.environ.get("AWS_PROFILE") or "default"
     section = "default" if profile == "default" else f"profile {profile}"
     parser = configparser.RawConfigParser()
@@ -286,12 +286,36 @@ def aws_login_cmd(cfg: dict) -> list[str]:
     except (configparser.Error, OSError):
         pass
     keys = set(parser[section].keys()) if parser.has_section(section) else set()
+    return profile, keys
+
+
+def profile_uses_sso(cfg: dict) -> bool:
+    """True when the profile is wired to IAM Identity Center (an org start URL)."""
+    _, keys = _profile_keys(cfg)
+    return "sso_session" in keys or "sso_start_url" in keys
+
+
+def aws_login_cmd(cfg: dict) -> list[str]:
+    """Pick the sign-in command that matches the profile's config.
+
+    IAM Identity Center (SSO) wins when present: `aws sso login` sends the
+    browser to the org's own start URL, which lives in the user's
+    ~/.aws/config and never in this plugin. Plain `aws login` only works
+    when the user already has a console session, so it is the fallback.
+    """
+    profile, _ = _profile_keys(cfg)
     profile_args = ["--profile", profile] if cfg.get("profile") else []
-    if "login_session" in keys:
-        return ["aws", "login", *profile_args]
-    if "sso_session" in keys or "sso_start_url" in keys:
+    if profile_uses_sso(cfg):
         return ["aws", "sso", "login", *profile_args]
     return ["aws", "login", *profile_args]
+
+
+def aws_configure_sso_cmd(cfg: dict) -> list[str]:
+    """The AWS CLI's own wizard: asks for the org start URL and region, opens
+    the browser, lets the user pick account and role, and writes the result
+    into ~/.aws/config under this profile."""
+    profile, _ = _profile_keys(cfg)
+    return ["aws", "configure", "sso", "--profile", profile]
 
 
 def _looks_like_auth_error(stderr: str) -> bool:
@@ -1571,7 +1595,12 @@ def render_aws(snap: dict, me: str, now: float) -> list[str]:
         login = " ".join(aws_login_cmd(cfg))
         lines.append("🔐 AWS sign-in required | color=orange")
         lines.append(f"--{fetched['error']} | size=12")
-        lines.append(f"--Sign in ({login}) | {me} param2=--aws-login terminal=false refresh=true")
+        lines.append(f"--Sign in ({login}) | {me} param2=--aws-login terminal=false")
+        if not profile_uses_sso(cfg):
+            lines.append("-----")
+            lines.append("--Does your org sign in through a start URL like https://xxx.awsapps.com/start ? | size=11 color=gray")
+            lines.append("--Then set up SSO once; after that Sign in opens your org's page. | size=11 color=gray")
+            lines.append(f"--Set up SSO sign-in (aws configure sso)… | {me} param2=--aws-configure-sso terminal=false")
     elif fetched["error"]:
         lines.append(f"⚠️ {fetched['error']} | color=red")
     elif not fetched["boxes"] and snap["last_poll"] == 0:
@@ -1856,6 +1885,10 @@ def action(name: str, instance_id: str, host: str = "") -> None:
         run_interactive(aws_login_cmd(cfg), "AWS sign in", after=REFRESH_SELF)
         return
 
+    if name == "--aws-configure-sso":
+        run_interactive(aws_configure_sso_cmd(cfg), "AWS SSO setup", after=REFRESH_SELF)
+        return
+
     if name == "--aws-usage-interval":
         if not (instance_id.isdigit() and int(instance_id) in USAGE_INTERVAL_CHOICES):
             notify(f"Invalid usage interval: {instance_id[:10]}")
@@ -1960,8 +1993,16 @@ def setup() -> None:
         if code == 0:
             break
         if _looks_like_auth_error(stderr) and attempt == 0:
+            if not profile_uses_sso(cfg):
+                print("Not signed in.")
+                print("If your org uses IAM Identity Center (a start URL like https://xxx.awsapps.com/start),")
+                print("answer y to run `aws configure sso`, which asks for that URL and writes it to ~/.aws/config.")
+                ans = input("Set up SSO sign-in now? [y/N] ").strip().lower()
+                if ans == "y":
+                    subprocess.run(aws_configure_sso_cmd(cfg))
+                    continue
             login = aws_login_cmd(cfg)
-            print(f"Not signed in. Running: {' '.join(login)}")
+            print(f"Running: {' '.join(login)}")
             subprocess.run(login)
             continue
         print(f"aws failed: {stderr.strip()[-300:]}")
@@ -2052,7 +2093,7 @@ if __name__ == "__main__":
         action(args[0], args[1], args[2] if len(args) == 3 else "")
     elif len(args) == 2 and args[0] == "--open-wandb":
         open_wandb_run(args[1])
-    elif args in (["--aws-login"], ["--aws-unpin"]):
+    elif args in (["--aws-login"], ["--aws-unpin"], ["--aws-configure-sso"]):
         action(args[0], "")
     elif args == ["--aws-setup"]:
         if sys.stdin.isatty():
